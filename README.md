@@ -45,8 +45,10 @@ Plain C, Win32 only. Windows 10 1703 or later.
 
 - Windows keeps some of its own surfaces in layers above every normal program: notification
   banners, the Start menu, the volume overlay, the lock screen and admin (UAC) prompts. The
-  cover cannot go above those. Windows does detect the cover as a full-screen app, which by
-  default holds notification banners back.
+  cover cannot go above those.
+- Notification banners show over the cover on purpose. The cover windows carry the
+  `NonRudeHWND` property so Windows does not treat them as a full-screen app; without it,
+  Windows turns on Do Not Disturb while the cover is up.
 - The corner overlaps the Widgets button (centered taskbar) or the Start button
   (left-aligned taskbar). Clicks inside the square never reach them.
 - With an auto-hiding taskbar, only the thin visible strip is clickable until the taskbar

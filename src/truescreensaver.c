@@ -126,6 +126,9 @@ static BOOL CALLBACK AddScreen(HMONITOR mon, HDC dc, LPRECT r, LPARAM lp)
                              r->right - r->left, r->bottom - r->top,
                              NULL, NULL, g_inst, NULL);
     if (w) {
+        // Tell the shell this is not a full-screen app. Otherwise Windows turns on
+        // Do Not Disturb while the cover is up and holds notification banners back.
+        SetPropW(w, L"NonRudeHWND", (HANDLE)1);
         SetLayeredWindowAttributes(w, 0, (BYTE)g_alpha, LWA_ALPHA);
         ShowWindow(w, SW_SHOW);
         g_black[g_blackCount++] = w;
@@ -141,7 +144,10 @@ static void CreateBlackWindows(void)
 
 static void DestroyBlackWindows(void)
 {
-    for (int i = 0; i < g_blackCount; i++) DestroyWindow(g_black[i]);
+    for (int i = 0; i < g_blackCount; i++) {
+        RemovePropW(g_black[i], L"NonRudeHWND");
+        DestroyWindow(g_black[i]);
+    }
     g_blackCount = 0;
 }
 
