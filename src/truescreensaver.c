@@ -384,12 +384,12 @@ static void TrayAdd(BOOL welcome)
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g_icon;
-    lstrcpynW(nid.szTip, L"True Screensaver: click for the Black out button", ARRAYSIZE(nid.szTip));
+    lstrcpynW(nid.szTip, L"True Screensaver: double-click to black out, click for more", ARRAYSIZE(nid.szTip));
     if (welcome) {
         nid.uFlags |= NIF_INFO;
         nid.dwInfoFlags = NIIF_INFO;
         lstrcpynW(nid.szInfoTitle, L"True Screensaver is running", ARRAYSIZE(nid.szInfoTitle));
-        lstrcpynW(nid.szInfo, L"Click this icon or the top-left corner of the taskbar to black out your screens. "
+        lstrcpynW(nid.szInfo, L"Double-click this icon or click the top-left corner of the taskbar to black out your screens. "
                               L"Press any key or click to come back.", ARRAYSIZE(nid.szInfo));
     }
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -453,6 +453,7 @@ static void CloseFlyout(void)
 static void ShowFlyout(void)
 {
     if (g_flyout) { CloseFlyout(); return; }
+    if (g_blackCount) return;  // e.g. the second click of a double-click that blacked out
     // Clicking the tray icon while the panel is open closes it (focus loss) and then
     // reports a click; don't reopen on that same click.
     if (GetTickCount() - g_flyoutClosedAt < 250) return;
@@ -662,6 +663,8 @@ static LRESULT CALLBACK MainProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case WM_CONTEXTMENU:   ShowMenu(GET_X_LPARAM(wp), GET_Y_LPARAM(wp)); break;
         case NIN_SELECT:
         case NIN_KEYSELECT:    ShowFlyout(); break;
+        // The first click of a double-click has already opened the panel; BlackOut closes it.
+        case WM_LBUTTONDBLCLK: BlackOut(RGB(0, 0, 0)); break;
         }
         return 0;
     case WM_BLACKOUT:  BlackOut(RGB(0, 0, 0)); return 0;

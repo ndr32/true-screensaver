@@ -16,6 +16,7 @@ Plain C, Win32 only. Windows 10 1703 or later.
 ## Controls
 
 - Left-click the taskbar's top-left corner: black out.
+- Double-click the tray icon: black out.
 - Left-click the tray icon: opens a small panel with a large "Black out" button and, to its
   left, four small colour buttons (green, red, blue, white) that fill the screens with that
   colour instead. Enter also blacks out; click elsewhere or press Esc to close the panel.
