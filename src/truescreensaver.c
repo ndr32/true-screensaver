@@ -59,7 +59,7 @@ static int       g_alpha;         // cover opacity, 0..255
 static int       g_fadeDir;       // +1 fading in, -1 fading out, 0 not fading
 static int       g_fadeFrom;
 static DWORD     g_fadeStart;
-static BOOL      g_swallowUp;     // eat the button-up of a click we already handled
+static UINT      g_swallowedButtons; // mouse buttons whose press we swallowed (bit per button)
 static DWORD     g_pendingKeyUp;  // key that ended the blackout; its key-up is eaten too
 static int       g_zone = DEFAULT_ZONE;
 static HWND      g_flyout;        // panel with the big button; exists only while open
@@ -285,7 +285,21 @@ static BOOL InHotZone(POINT pt)
     return pt.x >= r.left && pt.x < r.left + size && pt.y >= r.top && pt.y < r.top + size;
 }
 
+static UINT ButtonBit(WPARAM msg)
+{
+    switch (msg) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: return 1;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: return 2;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: return 4;
+    default:                                return 8;  // X buttons
+    }
+}
+
 // Runs for every mouse event on the system, so the common case (a move) exits first.
+//
+// A button-up is swallowed only if its button-down was. If the down reached Windows
+// (e.g. the second click of a tray double-click, which then blacks out), the up must
+// reach it too, or Windows believes the button is still held and starts a drag.
 static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && wp != WM_MOUSEMOVE) {
@@ -293,20 +307,21 @@ static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp)
         case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
             if (g_active) {                     // any click ends the blackout
                 g_active = FALSE;
-                g_swallowUp = TRUE;
+                g_swallowedButtons |= ButtonBit(wp);
                 PostMessageW(g_main, WM_RESTORE, 0, 0);
                 return 1;
             }
             if (wp == WM_LBUTTONDOWN && !g_blackCount &&
                 InHotZone(((const MSLLHOOKSTRUCT *)lp)->pt)) {
-                g_swallowUp = TRUE;             // Widgets/Start never see this click
+                g_swallowedButtons |= ButtonBit(wp);  // Widgets/Start never see this click
                 PostMessageW(g_main, WM_BLACKOUT, 0, 0);
                 return 1;
             }
+            g_swallowedButtons &= ~ButtonBit(wp);  // this press went through; so must its release
             break;
         case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP:
-            if (g_swallowUp || g_active) {
-                g_swallowUp = FALSE;
+            if (g_swallowedButtons & ButtonBit(wp)) {
+                g_swallowedButtons &= ~ButtonBit(wp);
                 return 1;
             }
             break;
@@ -320,13 +335,14 @@ static LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp)
     if (code == HC_ACTION) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
         BOOL down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
-        if (g_active) {
-            if (down) {
-                g_active = FALSE;
-                g_pendingKeyUp = k->vkCode;
-                PostMessageW(g_main, WM_RESTORE, 0, 0);
-            }
-            return 1;   // nothing typed while black reaches other apps
+        if (g_active && down) {
+            // The first key press ends the blackout and reaches no other app. Key
+            // releases pass through: their presses happened before the blackout, so
+            // Windows must see them released (same reasoning as the mouse hook).
+            g_active = FALSE;
+            g_pendingKeyUp = k->vkCode;
+            PostMessageW(g_main, WM_RESTORE, 0, 0);
+            return 1;
         }
         if (!down && g_pendingKeyUp && k->vkCode == g_pendingKeyUp) {
             g_pendingKeyUp = 0;
