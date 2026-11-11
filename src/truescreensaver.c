@@ -1,8 +1,9 @@
 // True Screensaver
-// Click the top-left corner of the taskbar to turn every screen pure black
-// (OLED pixels off). Press any key or click any mouse button to come back.
+// Double-click the tray icon to turn every screen pure black (OLED pixels off).
+// Press any key or click any mouse button to come back.
 //
-// Plain C + Win32. No timers or polling while idle.
+// Plain C + Win32. While idle there are no hooks, timers or polling; the mouse and
+// keyboard are only hooked while the screen is covered.
 
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
@@ -19,19 +20,17 @@
 #include <dwmapi.h>
 
 #define APP_NAME      L"TrueScreensaver"
-#define SETTINGS_KEY  L"Software\\TrueScreensaver"
 #define RUN_KEY       L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define STARTUP_ARG   L"--startup"
 #define MAIN_CLASS    L"TrueScreensaverMain"
 #define BLACK_CLASS   L"TrueScreensaverBlack"
 
 #define WM_TRAY       (WM_APP + 1)
-#define WM_BLACKOUT   (WM_APP + 2)
 #define WM_RESTORE    (WM_APP + 3)
-#define WM_UNHOOK_KB  (WM_APP + 4)
+#define WM_UNHOOK     (WM_APP + 4)
 
 #define TIMER_TOPMOST 1   // only runs while blacked out
-#define TIMER_KEYUP   2   // fallback for releasing the keyboard hook
+#define TIMER_UNHOOK  2   // fallback for removing the input hooks
 #define TIMER_FADE    3   // only runs during a fade
 #define TIMER_RAISE   4   // one-shot: another window appeared over the cover
 #define FADE_MS       250
@@ -41,15 +40,14 @@
 #define FLYOUT_H      80
 
 #define MAX_SCREENS   16
-#define DEFAULT_ZONE  32  // logical pixels, scaled by the taskbar's DPI
 
-enum { CMD_BLACKOUT = 1, CMD_SIZE_16, CMD_SIZE_32, CMD_SIZE_48, CMD_STARTUP, CMD_EXIT };
+enum { CMD_BLACKOUT = 1, CMD_STARTUP, CMD_EXIT };
 
 static HINSTANCE g_inst;
 static HWND      g_main;
 static HICON     g_icon;
 static UINT      g_taskbarCreated;
-static HHOOK     g_mouseHook, g_kbHook;
+static HHOOK     g_mouseHook, g_kbHook;           // only while covered
 static HWINEVENTHOOK g_evForeground, g_evZOrder;  // only while covered
 static HWND      g_black[MAX_SCREENS];
 static int       g_blackCount;
@@ -61,32 +59,12 @@ static int       g_fadeFrom;
 static DWORD     g_fadeStart;
 static UINT      g_swallowedButtons; // mouse buttons whose press we swallowed (bit per button)
 static DWORD     g_pendingKeyUp;  // key that ended the blackout; its key-up is eaten too
-static int       g_zone = DEFAULT_ZONE;
 static HWND      g_flyout;        // panel with the big button; exists only while open
 static HFONT     g_flyoutFont;
 static int       g_flyoutHot = -1; // button under the pointer: 0 Black out, 1..4 colour, -1 none
 static DWORD     g_flyoutClosedAt;
 
 // ------------------------------------------------------------------ settings
-
-static int LoadZone(void)
-{
-    DWORD v = 0, size = sizeof v;
-    if (RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, L"HotZoneSize", RRF_RT_REG_DWORD,
-                     NULL, &v, &size) == ERROR_SUCCESS && v > 0 && v <= 512)
-        return (int)v;
-    return DEFAULT_ZONE;
-}
-
-static void SaveZone(int zone)
-{
-    HKEY key;
-    DWORD v = (DWORD)zone;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL))
-        return;
-    RegSetValueExW(key, L"HotZoneSize", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
-    RegCloseKey(key);
-}
 
 static BOOL StartupEnabled(void)
 {
@@ -115,6 +93,8 @@ static void ToggleStartup(void)
 }
 
 // ------------------------------------------------------------------ blackout
+
+static void RemoveHooks(void);
 
 static BOOL CALLBACK AddScreen(HMONITOR mon, HDC dc, LPRECT r, LPARAM lp)
 {
@@ -171,28 +151,37 @@ static void FadeStep(void)
         int dir = g_fadeDir;
         g_fadeDir = 0;
         KillTimer(g_main, TIMER_FADE);
-        if (dir < 0) { DestroyBlackWindows(); return; }
+        if (dir < 0) { DestroyBlackWindows(); RemoveHooks(); return; }
     }
     for (int i = 0; i < g_blackCount; i++)
         SetLayeredWindowAttributes(g_black[i], 0, (BYTE)g_alpha, LWA_ALPHA);
 }
 
 static LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp);
+static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp);
 static void CloseFlyout(void);
 
-static void InstallKeyboardHook(void)
+// The mouse and keyboard are hooked only while the screen is covered, to catch the
+// click or key that ends it and keep it from reaching other apps.
+static void InstallHooks(void)
 {
-    KillTimer(g_main, TIMER_KEYUP);
+    KillTimer(g_main, TIMER_UNHOOK);
     g_pendingKeyUp = 0;
+    g_swallowedButtons = 0;
     if (!g_kbHook) g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, g_inst, 0);
+    if (!g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, g_inst, 0);
 }
 
-static void RemoveKeyboardHook(void)
+// Stays hooked until the cover is gone and the key or button that ended it has been
+// released, so that release is swallowed too (a lone Win-key release would otherwise
+// open the Start menu).
+static void RemoveHooks(void)
 {
-    if (g_active || !g_kbHook) return;
-    KillTimer(g_main, TIMER_KEYUP);
-    UnhookWindowsHookEx(g_kbHook);
-    g_kbHook = NULL;
+    if (g_active || g_blackCount || g_pendingKeyUp || g_swallowedButtons) return;
+    KillTimer(g_main, TIMER_UNHOOK);
+    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
+    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    g_kbHook = g_mouseHook = NULL;
 }
 
 static void KeepOnTop(void);
@@ -245,7 +234,7 @@ static void BlackOut(COLORREF color)
     g_active = TRUE;
     g_color = color;
     g_alpha = 0;
-    InstallKeyboardHook();   // the keyboard is only hooked while the screen is covered
+    InstallHooks();
     CreateBlackWindows();
     StartFade(+1);
     WatchOtherWindows(TRUE);
@@ -257,11 +246,10 @@ static void Restore(void)
     g_active = FALSE;
     WatchOtherWindows(FALSE);
     KillTimer(g_main, TIMER_TOPMOST);
-    if (g_blackCount) StartFade(-1);  // the windows are destroyed when the fade ends
-    // If a key ended the blackout, keep the hook until that key is released,
-    // so a lone Win-key release can't pop open the Start menu.
-    if (g_pendingKeyUp) SetTimer(g_main, TIMER_KEYUP, 2000, NULL);
-    else RemoveKeyboardHook();
+    // The windows are destroyed and the hooks removed when the fade ends. The timer is
+    // the fallback if the key or button that ended the blackout is never seen released.
+    if (g_blackCount) StartFade(-1);
+    SetTimer(g_main, TIMER_UNHOOK, 2000, NULL);
 }
 
 // Puts the cover back above every other always-on-top window.
@@ -273,24 +261,6 @@ static void KeepOnTop(void)
 
 // ------------------------------------------------------------------ hooks
 
-static BOOL InHotZone(POINT pt)
-{
-    // Only clicks that land on a taskbar count, so full-screen apps are left alone.
-    HWND root = GetAncestor(WindowFromPoint(pt), GA_ROOT);
-    if (!root) return FALSE;
-
-    WCHAR cls[32];
-    GetClassNameW(root, cls, 32);
-    if (lstrcmpW(cls, L"Shell_TrayWnd") && lstrcmpW(cls, L"Shell_SecondaryTrayWnd"))
-        return FALSE;
-
-    RECT r;
-    if (!GetWindowRect(root, &r)) return FALSE;
-    UINT dpi = GetDpiForWindow(root);
-    int size = MulDiv(g_zone, dpi ? (int)dpi : 96, 96);
-    return pt.x >= r.left && pt.x < r.left + size && pt.y >= r.top && pt.y < r.top + size;
-}
-
 static UINT ButtonBit(WPARAM msg)
 {
     switch (msg) {
@@ -301,7 +271,8 @@ static UINT ButtonBit(WPARAM msg)
     }
 }
 
-// Runs for every mouse event on the system, so the common case (a move) exits first.
+// While installed this runs for every mouse event on the system, so the common case
+// (a move) exits first.
 //
 // A button-up is swallowed only if its button-down was. If the down reached Windows
 // (e.g. the second click of a tray double-click, which then blacks out), the up must
@@ -317,17 +288,12 @@ static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp)
                 PostMessageW(g_main, WM_RESTORE, 0, 0);
                 return 1;
             }
-            if (wp == WM_LBUTTONDOWN && !g_blackCount &&
-                InHotZone(((const MSLLHOOKSTRUCT *)lp)->pt)) {
-                g_swallowedButtons |= ButtonBit(wp);  // Widgets/Start never see this click
-                PostMessageW(g_main, WM_BLACKOUT, 0, 0);
-                return 1;
-            }
             g_swallowedButtons &= ~ButtonBit(wp);  // this press went through; so must its release
             break;
         case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP:
             if (g_swallowedButtons & ButtonBit(wp)) {
                 g_swallowedButtons &= ~ButtonBit(wp);
+                PostMessageW(g_main, WM_UNHOOK, 0, 0);
                 return 1;
             }
             break;
@@ -352,7 +318,7 @@ static LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp)
         }
         if (!down && g_pendingKeyUp && k->vkCode == g_pendingKeyUp) {
             g_pendingKeyUp = 0;
-            PostMessageW(g_main, WM_UNHOOK_KB, 0, 0);
+            PostMessageW(g_main, WM_UNHOOK, 0, 0);
             return 1;
         }
     }
@@ -411,7 +377,7 @@ static void TrayAdd(BOOL welcome)
         nid.uFlags |= NIF_INFO;
         nid.dwInfoFlags = NIIF_INFO;
         lstrcpynW(nid.szInfoTitle, L"True Screensaver is running", ARRAYSIZE(nid.szInfoTitle));
-        lstrcpynW(nid.szInfo, L"Double-click this icon or click the top-left corner of the taskbar to black out your screens. "
+        lstrcpynW(nid.szInfo, L"Double-click this icon to black out your screens. "
                               L"Press any key or click to come back.", ARRAYSIZE(nid.szInfo));
     }
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -431,14 +397,9 @@ static void TrayRemove(void)
 static void ShowMenu(int x, int y)
 {
     // Built on demand and destroyed right after, so nothing is kept around while idle.
-    HMENU menu = CreatePopupMenu(), sizes = CreatePopupMenu();
-    AppendMenuW(sizes, MF_STRING | (g_zone == 16 ? MF_CHECKED : 0), CMD_SIZE_16, L"Small (16 px)");
-    AppendMenuW(sizes, MF_STRING | (g_zone == 32 ? MF_CHECKED : 0), CMD_SIZE_32, L"Medium (32 px)");
-    AppendMenuW(sizes, MF_STRING | (g_zone == 48 ? MF_CHECKED : 0), CMD_SIZE_48, L"Large (48 px)");
-
+    HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, CMD_BLACKOUT, L"Black out now");
     SetMenuDefaultItem(menu, CMD_BLACKOUT, FALSE);
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)sizes, L"Hot-corner size");
     AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CMD_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, CMD_EXIT, L"Exit");
@@ -447,13 +408,10 @@ static void ShowMenu(int x, int y)
     UINT cmd = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                                     x, y, 0, g_main, NULL);
     PostMessageW(g_main, WM_NULL, 0, 0);
-    DestroyMenu(menu); // also destroys the submenu
+    DestroyMenu(menu);
 
     switch (cmd) {
     case CMD_BLACKOUT: BlackOut(RGB(0, 0, 0)); break;
-    case CMD_SIZE_16:  g_zone = 16; SaveZone(16); break;
-    case CMD_SIZE_32:  g_zone = 32; SaveZone(32); break;
-    case CMD_SIZE_48:  g_zone = 48; SaveZone(48); break;
     case CMD_STARTUP:  ToggleStartup(); break;
     case CMD_EXIT:     DestroyWindow(g_main); break;
     }
@@ -668,7 +626,7 @@ static LRESULT CALLBACK BlackProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         DeleteObject(brush);
         return 1;
     }
-    // Backup paths in case Windows ever drops the global hooks.
+    // Backup paths in case Windows ever drops the hooks.
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         PostMessageW(g_main, WM_RESTORE, 0, 0);
@@ -689,14 +647,16 @@ static LRESULT CALLBACK MainProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case WM_LBUTTONDBLCLK: BlackOut(RGB(0, 0, 0)); break;
         }
         return 0;
-    case WM_BLACKOUT:  BlackOut(RGB(0, 0, 0)); return 0;
     case WM_RESTORE:   Restore(); return 0;
-    case WM_UNHOOK_KB: RemoveKeyboardHook(); return 0;
+    case WM_UNHOOK:    RemoveHooks(); return 0;
     case WM_TIMER:
         if (wp == TIMER_FADE) FadeStep();
         else if (wp == TIMER_RAISE) { KillTimer(w, TIMER_RAISE); KeepOnTop(); }
         else if (wp == TIMER_TOPMOST) KeepOnTop();
-        else if (wp == TIMER_KEYUP) { g_pendingKeyUp = 0; RemoveKeyboardHook(); }
+        else if (wp == TIMER_UNHOOK) {
+            KillTimer(w, TIMER_UNHOOK);
+            if (!g_active) { g_pendingKeyUp = 0; g_swallowedButtons = 0; RemoveHooks(); }
+        }
         return 0;
     case WM_DISPLAYCHANGE:
         if (g_blackCount) { DestroyBlackWindows(); CreateBlackWindows(); }  // monitor added/removed
@@ -706,8 +666,9 @@ static LRESULT CALLBACK MainProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g_active = FALSE;
         Restore();
         DestroyBlackWindows();  // exiting: don't wait for the fade
-        RemoveKeyboardHook();
-        if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+        g_pendingKeyUp = 0;
+        g_swallowedButtons = 0;
+        RemoveHooks();
         TrayRemove();
         PostQuitMessage(0);
         return 0;
@@ -732,17 +693,6 @@ static BOOL HasStartupArg(void)
     return found;
 }
 
-static void DisablePowerThrottling(void)
-{
-    // Every mouse event on the system waits on our hook, so don't let Windows
-    // throttle this process as background work.
-    PROCESS_POWER_THROTTLING_STATE pt = {0};
-    pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-    pt.StateMask = 0;
-    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
-}
-
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdLine, int show)
 {
     (void)prev; (void)cmdLine; (void)show;
@@ -752,8 +702,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdLine, int show)
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    DisablePowerThrottling();
-    g_zone = LoadZone();
 
     WNDCLASSW wc = {0};
     wc.hInstance = inst;
@@ -777,12 +725,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdLine, int show)
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     g_icon = MakeIcon();
     TrayAdd(!HasStartupArg());
-
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, inst, 0);
-    if (!g_mouseHook) {
-        MessageBoxW(NULL, L"Could not install the mouse hook.", L"True Screensaver", MB_ICONERROR);
-        DestroyWindow(g_main);
-    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
